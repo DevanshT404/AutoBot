@@ -5,12 +5,32 @@ A pragmatic browser-use agent for a choreographed college major-project demo.
 ## Five-module split
 
 ```text
-main.py      -> CLI, local @variables, run commands
-agent.py     -> planning loop, checkpoints, persistence, logs
-llm.py       -> DeepSeek tool-call planner
-browser.py   -> Chromium + semantic DOM observation
-actions.py   -> local action execution + batch invalidation
+main.py            -> startup, wiring
+browser_window.py  -> chat window (Tk, main thread)
+service.py         -> worker thread that owns Chromium + the agent; @variable parsing
+agent.py           -> planning loop, checkpoints, completion verification, logs
+llm.py             -> DeepSeek planner + completion verifier
+browser.py         -> Chromium, tab tracking, semantic DOM observation
+actions.py         -> local action execution + batch invalidation
 ```
+
+## Finishing a task
+
+`done()` must stand alone (not bundled with other actions) and carries
+`success` and `evidence`. A second model call checks a `success=true` claim
+against the live page; if the page doesn't prove it, the agent is sent back to
+work (up to twice). The planner also sees its recent action history, and the run
+stops if it repeats the same batch on an unchanged page.
+
+## Tabs
+
+The planner sees every open tab (id, title, url, active) and the DOM of the
+active tab only. Tools: `switch_tab`, `open_tab`, `close_tab`. At task start the
+agent adopts the tab you are looking at; a tab opened by an agent action becomes
+active automatically (the batch is replanned); tabs you open yourself never take
+over mid-task.
+
+Set `AGENT_DEBUG=1` to print each DOM snapshot to the terminal.
 
 ## `.env`
 
@@ -27,9 +47,12 @@ You do not need to expose the API key in the terminal.
 
 ## Browser startup
 
-When `python main.py` starts, it launches Chromium before waiting for your
-first task. A persistent profile is used, so the browser window stays available
-for the agent and cookies/session state can persist between runs.
+When `python main.py` starts, it launches Chromium and a small BrowserBot desktop
+window with an address bar, back/forward/reload controls, and an agent task
+field. The Chromium profile is persistent, so cookies and signed-in sessions
+can carry over between launches. Sign in once in this browser window; it does
+not automatically import passwords or sessions from your regular Chrome
+profile.
 
 If Chromium cannot be found automatically, supply its executable path:
 

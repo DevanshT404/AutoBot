@@ -2,12 +2,83 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+from collections import deque
 from typing import Dict, List, Any, Optional
 
-from actions import ActionExecutor
+from actions import ActionExecutor, STOPPED
+
+MAX_ITERATIONS = 40
+MAX_VERIFIER_REJECTIONS = 2
+HISTORY_WINDOW = 8
+DEBUG = bool(os.getenv("AGENT_DEBUG"))
+
+
+class ConsoleIO:
+    """Default front end: prints progress, asks questions on the terminal."""
+
+    def say(self, kind: str, text: str):
+        print(f"  [{kind}] {text}")
+
+    def ask(self, question: str, secret: bool = False) -> Optional[str]:
+        print(f"\nAgent needs you: {question}")
+        if secret:
+            from getpass import getpass
+            return getpass("You> ")
+        return input("You> ").strip()
+
+    def should_stop(self) -> bool:
+        return False
+
+
+def _target_label(target: Optional[Dict[str, Any]]) -> str:
+    if not target:
+        return ""
+    label = (
+        target.get("name") or target.get("text") or target.get("placeholder")
+        or target.get("css") or target.get("role") or "element"
+    )
+    return f"“{label}”"
+
+
+def describe_call(call: Dict[str, Any]) -> str:
+    name = call["name"]
+    a = call.get("arguments", {}) or {}
+    if name == "click":
+        return f"Click {_target_label(a.get('target'))}"
+    if name == "type":
+        text = str(a.get("text", ""))
+        shown = text if text.startswith("@") else f"“{text[:60]}”"
+        return f"Type {shown} into {_target_label(a.get('target'))}"
+    if name == "press":
+        where = _target_label(a.get("target"))
+        return f"Press {a.get('key')}" + (f" in {where}" if where else "")
+    if name == "scroll":
+        return f"Scroll {a.get('direction', 'down')}"
+    if name == "wait":
+        return f"Wait {a.get('seconds', 0.5)}s"
+    if name == "navigate":
+        return f"Go to {a.get('url')}"
+    if name == "switch_tab":
+        return f"Switch to tab {a.get('tab_id')}"
+    if name == "open_tab":
+        return "Open a new tab" + (f" at {a['url']}" if a.get("url") else "")
+    if name == "close_tab":
+        return f"Close tab {a.get('tab_id')}"
+    if name == "click_seat":
+        return f"Pick seat {a.get('seat')}"
+    if name == "request_human":
+        return f"Ask for your help: {a.get('reason')}"
+    if name == "checkpoint":
+        return f"Checkpoint: {a.get('description', a.get('id'))}"
+    if name == "ask_user":
+        return f"Ask you: {a.get('question')}"
+    if name == "done":
+        return f"Finish: {a.get('message')}"
+    return name
 
 
 def utc_stamp() -> str:
@@ -200,15 +271,30 @@ class BrowserAgent:
         planner,
         logs_dir: str = "logs",
         run_id: Optional[str] = None,
+        io: Optional[Any] = None,
     ):
         self.browser = browser
         self.planner = planner
         self.logs_dir = logs_dir
         self.resume_run_id = run_id
+        self.io = io or ConsoleIO()
         self.state: Optional[AgentState] = None
         self.logger: Optional[FileLogger] = None
 
-    def run(self, task: str, secrets: Dict[str, str]) -> str:
+    def _finish(self, status: str, message: str) -> str:
+        self.state.status = status
+        self.state.last_event = message
+        self.logger.event(f"task_{status}", message=message)
+        self.logger.save_state(self.state)
+        self.io.say("info", f"Run logs: {self.logger.run_dir}")
+        return message
+
+    def run(
+        self,
+        task: str,
+        secrets: Dict[str, str],
+        prior: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         self.logger = FileLogger(
             self.logs_dir,
             task,
@@ -229,14 +315,59 @@ class BrowserAgent:
 
         secret_store = SecretStore()
         secret_store.set_many(secrets)
-        executor = ActionExecutor(self.browser, secret_store)
+        executor = ActionExecutor(self.browser, secret_store, self.io.should_stop)
+
+        history: List[str] = []
+        last_signature = None
+        repeats = 0
+        rejections = 0
+        recent = deque(maxlen=6)  # recent batch signatures, for A/B/A/B loops
+        helped = 0  # times the human was asked to unstick us
+        last_path = None  # origin+path of the last page seen; scroll to top on change
 
         try:
-            for _ in range(40):
+            self.browser.sync_to_foreground_tab()
+
+            for _ in range(MAX_ITERATIONS):
+                if self.io.should_stop():
+                    return self._finish("stopped", STOPPED)
+
                 self.state.iterations += 1
                 self.logger.save_state(self.state)
 
                 self.browser.wait_stable()
+
+                try:
+                    recovered = self.browser.recover_playback_error()
+                except Exception:
+                    recovered = None
+                if recovered:
+                    self.io.say("warn", recovered)
+                    self.browser.wait_stable()
+
+                notices = [
+                    n for n in self.browser.drain_notices()
+                    if n not in self.state.last_event
+                ]
+                if notices:
+                    self.state.last_event = (self.state.last_event + " " + " ".join(notices)).strip()
+
+                # New page (origin+path changed): some sites auto-scroll to the
+                # bottom on load and hide the pickers above; reset to the top.
+                try:
+                    from urllib.parse import urlsplit
+                    from actions import SCROLL_TOP_JS
+                    _u = urlsplit(self.browser.current_page().url)
+                    _path = f"{_u.scheme}://{_u.netloc}{_u.path}"
+                except Exception:
+                    _path = None
+                if _path and _path != last_path:
+                    last_path = _path
+                    try:
+                        self.browser.current_page().evaluate(SCROLL_TOP_JS)
+                        self.browser.wait_stable()
+                    except Exception:
+                        pass
 
                 dom = self.browser.semantic_snapshot()
                 dom_path = self.logger.save_dom(
@@ -250,15 +381,28 @@ class BrowserAgent:
                     path=dom_path,
                 )
 
-                print("\n[DOM] Current semantic snapshot:")
-                print(dom)
+                if DEBUG:
+                    print("\n[DOM] Current semantic snapshot:")
+                    print(dom)
 
-                calls = self.planner.plan(
+                plan_args = dict(
                     task=task,
                     dom_snapshot=dom,
                     completed_checkpoints=self.state.completed_checkpoints,
                     event=self.state.last_event,
+                    history=history[-HISTORY_WINDOW:],
+                    conversation=prior,
                 )
+                try:
+                    calls = self.planner.plan(**plan_args)
+                except Exception:
+                    # One retry for transient API/network trouble.
+                    self.io.say("warn", "Planner call failed; retrying once…")
+                    time.sleep(2)
+                    calls = self.planner.plan(**plan_args)
+
+                if self.io.should_stop():
+                    return self._finish("stopped", STOPPED)
 
                 batch_path = self.logger.save_batch(
                     self.state.iterations,
@@ -272,24 +416,41 @@ class BrowserAgent:
                     action_count=len(calls),
                 )
 
-                print("\n[PLAN]")
-                for i, call in enumerate(calls, start=1):
-                    print(f"  {i}. {call['name']} {call.get('arguments', {})}")
+                for call in calls:
+                    if call["name"] not in ("checkpoint", "done", "ask_user", "request_human"):
+                        self.io.say("step", describe_call(call))
 
                 clarification = next(
-                    (c for c in calls if c["name"] == "ask_user"),
+                    (c for c in calls if c["name"] in ("ask_user", "request_human")),
                     None,
                 )
                 if clarification:
-                    question = clarification["arguments"]["question"]
+                    c_args = clarification.get("arguments") or {}
+                    needs_human = clarification["name"] == "request_human"
+                    kind = c_args.get("kind") or "other"
+                    if needs_human:
+                        reason = c_args.get("reason") or "I need your help to continue."
+                        question = f"I need your help ({kind}): {reason}"
+                        if kind == "seat_selection":
+                            question += " Please pick the seats in the browser window, then reply 'done'."
+                        att = getattr(self.io, "request_attention", None)
+                        if att:
+                            att(reason)
+                    else:
+                        question = c_args.get("question") or ""
                     self.logger.event(
                         "clarification_requested",
                         question=question,
                     )
-                    print(f"\nAgent needs you: {question}")
-                    answer = input("You> ").strip()
+                    answer = self.io.ask(question)
+                    if answer is None or self.io.should_stop():
+                        return self._finish("stopped", STOPPED)
 
-                    self.state.last_event = f"User clarification: {answer}"
+                    history.append(f"#{self.state.iterations}: asked user “{question}” -> user answered")
+                    if needs_human:
+                        self.state.last_event = f"Human helped ({kind}): {answer}. Re-inspect the page."
+                    else:
+                        self.state.last_event = f"User clarification: {answer}"
                     self.logger.event(
                         "clarification_answered",
                         answer=answer,
@@ -301,6 +462,66 @@ class BrowserAgent:
                     (c for c in calls if c["name"] == "done"),
                     None,
                 )
+                # done() only counts when it stands alone. Bundled with real
+                # actions, those actions' outcome is still unknown.
+                done_is_final = bool(done_call) and all(
+                    c["name"] in ("checkpoint", "done")
+                    for c in calls[:calls.index(done_call)]
+                )
+
+                # Stuck detection: identical batch on an unchanged page, or
+                # A-B-A-B oscillation between two batches.
+                try:
+                    fp = self.browser.state_fingerprint()
+                except Exception:
+                    fp = ""
+                signature = (
+                    json.loads(dom).get("url"),
+                    fp,
+                    json.dumps(
+                        [c for c in calls if c["name"] != "checkpoint"],
+                        sort_keys=True,
+                    ),
+                )
+                repeats = repeats + 1 if signature == last_signature else 0
+                oscillating = (
+                    len(recent) >= 3
+                    and signature == recent[-2]
+                    and recent[-1] == recent[-3]
+                )
+                recent.append(signature)
+                last_signature = signature
+                if repeats >= 4 or oscillating:
+                    if helped >= 2:
+                        return self._finish(
+                            "failed",
+                            "I got stuck repeating the same actions without the page changing, so I stopped.",
+                        )
+                    attention = getattr(self.io, "request_attention", None)
+                    if attention:
+                        attention("Agent is stuck and needs help")
+                    answer = self.io.ask(
+                        "I'm stuck: I keep repeating the same actions and the page isn't changing. "
+                        "What should I do? (You can also do the step yourself in the browser and reply 'done'.)"
+                    )
+                    if answer is None or self.io.should_stop():
+                        return self._finish("stopped", STOPPED)
+                    if not answer.strip():
+                        return self._finish(
+                            "failed",
+                            "I got stuck repeating the same actions without the page changing, so I stopped.",
+                        )
+                    helped += 1
+                    history.append(f"#{self.state.iterations}: stuck -> user guidance: {answer}")
+                    self.state.last_event = (
+                        f"User guidance after getting stuck: {answer}. "
+                        "Re-inspect the page and do something different."
+                    )
+                    repeats = 0
+                    last_signature = None
+                    recent.clear()
+                    self.logger.save_state(self.state)
+                    continue
 
                 result = executor.execute(calls)
 
@@ -319,9 +540,7 @@ class BrowserAgent:
                             description,
                             self.state.iterations,
                         )
-                        print(
-                            f"[checkpoint] {checkpoint_id} -> {checkpoint_path}"
-                        )
+                        self.io.say("checkpoint", description)
 
                 # Always capture post-batch state, successful or not.
                 after_dom = self.browser.semantic_snapshot()
@@ -336,25 +555,75 @@ class BrowserAgent:
                     path=after_path,
                 )
 
+                if result.reason == STOPPED:
+                    return self._finish("stopped", STOPPED)
+
+                done_args = done_call["arguments"] if done_call else {}
+                ran = [
+                    describe_call(c)
+                    for c in calls[:result.completed_actions]
+                    if c["name"] not in ("checkpoint", "done")
+                ]
+                outcome = "ok" if result.success else f"interrupted ({result.reason})"
+                try:
+                    now_url = self.browser.current_page().url
+                except Exception:
+                    now_url = "?"
+                history.append(
+                    f"#{self.state.iterations}: {'; '.join(ran) or '(no browser actions)'} "
+                    f"-> {outcome}; now on tab {self.browser.tab_id()} at {now_url[:120]}"
+                )
+
                 if result.success:
-                    if done_call:
-                        self.state.status = "done"
-                        self.state.last_event = done_call["arguments"]["message"]
-                        self.logger.event(
-                            "task_completed",
-                            message=self.state.last_event,
+                    if done_call and done_is_final:
+                        message = done_args.get("message", "Done.")
+
+                        if not done_args.get("success", True):
+                            self.io.say("warn", "Agent reports it could not complete the task.")
+                            return self._finish("blocked", message)
+
+                        verdict = self.planner.verify(
+                            task, after_dom, history[-HISTORY_WINDOW:],
+                            message, done_args.get("evidence", ""),
+                        )
+                        self.logger.event("completion_verified", **verdict)
+                        if verdict["achieved"]:
+                            return self._finish("done", message)
+
+                        rejections += 1
+                        if rejections > MAX_VERIFIER_REJECTIONS:
+                            return self._finish(
+                                "unverified",
+                                f"{message}\n(I could not confirm this is complete: {verdict['reason']})",
+                            )
+                        self.io.say("warn", f"Not finished yet: {verdict['reason']}")
+                        self.state.last_event = (
+                            "Your done() was REJECTED by the verifier: "
+                            f"{verdict['reason']} The task is NOT complete; keep working on it "
+                            "(or call done(success=false) if it is truly impossible)."
                         )
                         self.logger.save_state(self.state)
-                        return (
-                            f"{self.state.last_event}\n"
-                            f"Run logs: {self.logger.run_dir}"
+                        continue
+
+                    if done_call:
+                        self.state.last_event = (
+                            "You called done() together with other actions, so it was ignored. "
+                            "Inspect the new state; if the goal is achieved call done() alone."
                         )
+                        self.logger.save_state(self.state)
+                        continue
 
                     self.state.last_event = (
                         f"Batch completed successfully. "
                         f"Completed checkpoints: "
                         f"{self.state.completed_checkpoints}"
                     )
+                    if repeats >= 2:
+                        self.state.last_event += (
+                            f" WARNING: you have now sent the same actions {repeats + 1} times "
+                            "and the page did not change. Try a different approach (check `dialogs`/in_popup elements first), use request_human, "
+                            "or call done(success=false)."
+                        )
                     self.logger.event(
                         "batch_completed",
                         iteration=self.state.iterations,
@@ -388,17 +657,12 @@ class BrowserAgent:
                 )
 
                 self.logger.save_state(self.state)
-                print(f"[replan] {self.state.last_event}")
-                print(f"[logs] {self.logger.run_dir}")
+                self.io.say("warn", f"Replanning: {result.reason}")
 
-            self.state.status = "failed"
-            self.state.last_event = "Iteration limit reached."
-            self.logger.event(
-                "task_failed",
-                reason=self.state.last_event,
+            return self._finish(
+                "failed",
+                "I ran out of steps before finishing this task.",
             )
-            self.logger.save_state(self.state)
-            return f"{self.state.last_event}\nRun logs: {self.logger.run_dir}"
 
         finally:
             secret_store.close()
